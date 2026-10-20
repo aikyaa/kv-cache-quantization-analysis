@@ -1,0 +1,8 @@
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.8
+torch>=2.2
+transformers>=4.45
+datasets>=2.18
+pytest>=8.0
+scalesim>=2.0
