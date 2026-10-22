@@ -5,3 +5,4 @@ __pycache__/
 data/
 third_party/
 *.egg-info/
+sim_tmp/
