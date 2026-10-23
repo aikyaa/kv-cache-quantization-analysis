@@ -5,6 +5,7 @@ models = {
     "llama2-7b": dict(layers=32, d=4096, heads=32, kv_heads=32, head_dim=128, ff=11008, vocab=32000, gated=True),
     "llama3-8b": dict(layers=32, d=4096, heads=32, kv_heads=8, head_dim=128, ff=14336, vocab=128256, gated=True),
     "llama3.2-1b": dict(layers=16, d=2048, heads=32, kv_heads=8, head_dim=64, ff=8192, vocab=128256, gated=True),
+    "llama2-70b": dict(layers=80, d=8192, heads=64, kv_heads=8, head_dim=128, ff=28672, vocab=32000, gated=True),
     "gpt2": dict(layers=12, d=768, heads=12, kv_heads=12, head_dim=64, ff=3072, vocab=50257, gated=False),
 }
 
@@ -15,12 +16,12 @@ kv_formats = {
     "int4": dict(bits=4, group=64, meta=4, dequant=3),
 }
 
-# public peak specs (dense fp16). vec = non tensor core flops
+# public peak specs (dense fp16). vec = non tensor core flops, link = chip to chip per direction
 # "NPU" is made up: big matmul array, slow memory, tiny vector unit
 hw = {
-    "A100": dict(flops=312e12, vec=78e12, bw=2.039e12, mem=80e9),
-    "H100": dict(flops=989e12, vec=134e12, bw=3.35e12, mem=80e9),
-    "NPU": dict(flops=200e12, vec=4e12, bw=0.8e12, mem=64e9),
+    "A100": dict(flops=312e12, vec=78e12, bw=2.039e12, mem=80e9, link=300e9),
+    "H100": dict(flops=989e12, vec=134e12, bw=3.35e12, mem=80e9, link=450e9),
+    "NPU": dict(flops=200e12, vec=4e12, bw=0.8e12, mem=64e9, link=100e9),
 }
 
 
