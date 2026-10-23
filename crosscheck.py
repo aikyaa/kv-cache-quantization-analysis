@@ -25,7 +25,7 @@ def make_jobs():
     for ctx in [512, 2048, 8192]:
         for fname, f in kv_formats.items():
             # scalesim has no data types, so give it more words/cycle for narrow kv
-            words = int(BYTES_PER_CYCLE / bytes_per_value(f)) // 8 * 8
+            words = int(BYTES_PER_CYCLE / bytes_per_value(f)) // 64 * 64
             jobs.append(("qk_%s_L%d" % (fname, ctx), group, ctx, hd, words))
             jobs.append(("pv_%s_L%d" % (fname, ctx), group, hd, ctx, words))
     return jobs
