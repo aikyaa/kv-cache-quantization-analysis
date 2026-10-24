@@ -1,0 +1,12 @@
+model,kv,ppl
+gpt2,fp32 (no quant),31.1688
+gpt2,fp16,31.1687
+gpt2,int8 g64,31.1717
+gpt2,int4 g64,32.3203
+gpt2,int4 g32,31.9772
+gpt2,int4 K per-channel,31.2755
+gpt2,int3 g32,37.9632
+gpt2,int2 g32,162.1070
+gpt2,int2 K per-channel,37.3382
+gpt2,"K int8, V int4",31.2262
+gpt2,"K int4, V int8",32.2442
