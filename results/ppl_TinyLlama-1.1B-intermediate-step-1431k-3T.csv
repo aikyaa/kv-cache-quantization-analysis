@@ -1,0 +1,12 @@
+model,kv,ppl
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,fp32 (no quant),7.1781
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,fp16,7.1781
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int8 g64,7.1789
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int4 g64,7.4012
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int4 g32,7.3165
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int4 K per-channel,7.2326
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int3 g32,7.8486
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int2 g32,37.4637
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,int2 K per-channel,9.5924
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,"K int8, V int4",7.2000
+TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,"K int4, V int8",7.3833
