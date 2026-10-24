@@ -122,26 +122,54 @@ python ppl.py gpt2 1024 65536
 python plot_ppl.py
 ```
 
-WikiText-2 test, first 64k tokens, 1024 token windows:
+WikiText-2 test. GPT-2 small (12 heads, MHA): first 64k tokens, 1024 token windows.
+TinyLlama-1.1B (32 query heads, 4 KV heads): first 16k tokens, 2048 token windows.
 
-| KV | bytes vs fp16 | perplexity |
-|---|---|---|
-| fp16 | 1.00 | 31.17 |
-| int8 g64 | 0.53 | 31.17 |
-| K int8, V int4 | 0.41 | 31.23 |
-| int4 K per-channel, V per-token | 0.30 | 31.28 |
-| int4 g32 | 0.31 | 31.98 |
-| K int4, V int8 | 0.41 | 32.24 |
-| int4 g64 | 0.28 | 32.32 |
-| int2 K per-channel | 0.19 | 37.34 |
-| int3 g32 | 0.25 | 37.96 |
-| int2 g32 | 0.19 | 162.1 |
+| KV | bytes vs fp16 | GPT-2 | TinyLlama |
+|---|---|---|---|
+| fp16 | 1.00 | 31.17 | 7.178 |
+| int8 g64 | 0.53 | 31.17 | 7.179 |
+| K int8, V int4 | 0.41 | 31.23 | 7.200 |
+| int4 K per-channel, V per-token | 0.30 | 31.28 | 7.233 |
+| int4 g32 | 0.31 | 31.98 | 7.317 |
+| K int4, V int8 | 0.41 | 32.24 | 7.383 |
+| int4 g64 | 0.28 | 32.32 | 7.401 |
+| int2 K per-channel | 0.19 | 37.34 | 9.592 |
+| int3 g32 | 0.25 | 37.96 | 7.849 |
+| int2 g32 | 0.19 | 162.1 | 37.46 |
 
 - int8 is free.
 - Keys are the sensitive half: int4 keys cost +1.1 ppl, int4 values only +0.06.
 - Grouping keys per channel instead of per token (the KIVI trick) gets int4 to +0.1 ppl,
   and takes int2 from 162 to 37, because a few key channels have much larger outliers than the rest.
 - So int4 with per-channel keys moves 30% of the fp16 bytes for almost no accuracy loss.
+  Both models agree on the ordering, so this isn't a GPT-2 quirk.
+
+`decode_check.py` runs GPT-2 token by token with a real KV cache to make sure the full-sequence
+numbers above are what decode actually sees (4 chunks of 512 tokens, `results/decode_check.csv`):
+
+| KV | ppl full sequence | ppl token by token | greedy tokens same as fp16 |
+|---|---|---|---|
+| fp16 | 34.18 | 34.18 | 100% |
+| int8 g64 | 34.16 | 34.16 | 76% |
+| int4 K per-channel | 34.26 | 34.20 | 57% |
+| int4 g64 | 35.04 | 35.07 | 16% |
+| int2 g32 | 127.7 | 129.3 | 4% |
+
+Per-token quantization is idempotent, so re-quantizing the cache every step gives the same
+numbers as storing it quantized. Per-channel keys differ a little because their groups run
+along tokens and change as the cache grows. Greedy outputs drift apart even when perplexity
+doesn't move: one different token early on changes everything after it, so token match is a
+much harsher metric than perplexity.
+
+## Tests
+
+```
+python -m pytest
+```
+
+Checks the byte counts against hand math, that the crossover batch really balances compute and
+memory time, the all-reduce byte counts, and that int4 packing round trips.
 
 ## Multi-chip
 
