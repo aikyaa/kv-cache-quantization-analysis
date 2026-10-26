@@ -12,22 +12,22 @@ out = "results/figures/"
 HOP_LATENCY = 2e-6  # per message, roughly what nvlink all-reduces see
 
 
-def allreduce(size, n, link, innet=False):
+def allreduce(size, n, link, innet=False, hop=HOP_LATENCY):
     # returns (bytes sent per chip, time)
     if n == 1:
         return 0, 0
     if innet:
         # switch adds up the partial sums: send once, get the result back once
         sent = size
-        lat = 2 * HOP_LATENCY
+        lat = 2 * hop
     else:
         # ring: reduce-scatter + all-gather
         sent = 2 * (n - 1) / n * size
-        lat = 2 * (n - 1) * HOP_LATENCY
+        lat = 2 * (n - 1) * hop
     return sent, sent / link + lat
 
 
-def tp_step(m, f, h, batch, ctx, n, innet=False, act_bytes=2):
+def tp_step(m, f, h, batch, ctx, n, innet=False, act_bytes=2, hop=HOP_LATENCY):
     # tensor parallel over n chips, kv heads split across chips
     P = num_params(m)
     kv_heads_per_chip = max(m["kv_heads"] / n, 1)  # can't split a kv head, so it gets copied
@@ -38,7 +38,7 @@ def tp_step(m, f, h, batch, ctx, n, innet=False, act_bytes=2):
     t_comp = flops / h["flops"]
     # two all-reduces per layer (after attention and after mlp)
     size = batch * m["d"] * act_bytes
-    sent, t_one = allreduce(size, n, h["link"], innet)
+    sent, t_one = allreduce(size, n, h["link"], innet, hop)
     t_link = 2 * m["layers"] * t_one
     return dict(t_hbm=t_hbm, t_comp=t_comp, t_link=t_link,
                 time=max(t_hbm, t_comp) + t_link, link_bytes=2 * m["layers"] * sent,
@@ -132,3 +132,27 @@ if __name__ == "__main__":
     mig = pd.DataFrame(rows)
     mig.to_csv("results/kv_migration.csv", index=False, float_format="%.4g")
     print(mig.to_string())
+
+    # 5. the hop latency is a guess, so sweep it
+    hops = np.logspace(np.log10(0.25e-6), np.log10(10e-6), 30)
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    rows = []
+    for (name, fname, innet, ab), c in zip(setups[:3], line_colors):
+        t = [tp_step(m, kv_formats[fname], h, 32, 32768, 8, innet, ab, hop)["time"] * 1e3 for hop in hops]
+        ax.plot(hops * 1e6, t, color=c, label=name)
+        for hop, tt in zip(hops, t):
+            rows.append(dict(setup=name, hop_us=hop * 1e6, step_ms=tt))
+    ax.axvline(HOP_LATENCY * 1e6, color="gray", ls=":", lw=1)
+    ax.set_xscale("log")
+    ax.set_xlabel("latency per hop (us)")
+    ax.set_ylabel("ms per decode step")
+    ax.set_title("Llama-2-70B, 8x H100, batch 32, ctx 32k")
+    ax.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out + "multichip_latency_sweep.png", dpi=150)
+    plt.close()
+    sweep = pd.DataFrame(rows)
+    sweep.to_csv("results/multichip_latency_sweep.csv", index=False, float_format="%.4g")
+    for hop in [0.5e-6, 1e-6, 5e-6]:
+        r = [tp_step(m, kv_formats["int4"], h, 32, 32768, 8, i, 2, hop)["time"] * 1e3 for i in [False, True]]
+        print("hop %.1f us: int4 ring %.2f ms, in-network %.2f ms" % (hop * 1e6, r[0], r[1]))
