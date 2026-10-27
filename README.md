@@ -108,7 +108,27 @@ so KV compression only pays off once the array is sized or mapped for small M.
 - PV re-reads its filter twice (N = 64 fills only half the array's columns)
 - the up/gate weights (2048 x 16384) don't fit in SRAM, so they're fetched twice and the array stalls
 
-Tables: `results/scalesim_runs.csv`, `scalesim_compare.csv`, `scalesim_layer_steps.csv`.
+**The dataflow is most of the gap.** `dataflow.py` reruns some of the GEMMs as output stationary (os)
+and input stationary (is):
+
+| gemm | roofline | ws | os | is | best / roofline |
+|---|---|---|---|---|---|
+| qkv, batch 1 | 24,596 | 147,100 | 55,247 | 55,263 | 2.2 |
+| qkv, batch 64 | 25,856 | 171,300 | 55,247 | 55,263 | 2.1 |
+| down, batch 16 | 66,176 | 407,600 | 135,135 | 155,519 | 2.0 |
+| QK, fp16, 2k | 545 | 6,175 | 5,087 | 2,429 | 4.5 |
+| QK, int4, 2k | 180 | 6,175 | 5,087 | 2,429 | 13.5 |
+| PV, fp16, 2k | 545 | 6,175 | 2,301 | 7,135 | 4.2 |
+| PV, int4, 2k | 180 | 6,175 | 2,301 | 7,135 | 12.8 |
+
+Weight stationary is the worst choice for decode: it reloads the array for every weight tile and
+then only streams M rows through it. Output stationary streams K through the array instead, which
+cuts linear layers to about 2x the roofline. Batch 1 and batch 64 take the same cycles, so on this
+array any batch up to 128 is free. Even the best dataflow still shows no gain from int4 KV, since
+the array, not DRAM, is what sets the time.
+
+Tables: `results/scalesim_runs.csv`, `scalesim_compare.csv`, `scalesim_layer_steps.csv`,
+`scalesim_dataflows.csv`.
 
 ## Accuracy cost
 
@@ -162,6 +182,25 @@ along tokens and change as the cache grows. Greedy outputs drift apart even when
 doesn't move: one different token early on changes everything after it, so token match is a
 much harsher metric than perplexity.
 
+## Real CPU check
+
+`cpu_bench.py` runs flash-decoding style attention for one Llama-3-8B layer (8 KV heads, 4 query
+heads each) on this laptop's CPU, with the cache stored as fp32, fp16, int8 or packed int4 and
+dequantized one 4096-token block at a time in plain PyTorch. 4 threads, median of 7 runs.
+
+| ctx | fp32 | fp16 | int8 | int4 |
+|---|---|---|---|---|
+| 16k | 12 ms | 34 ms | 40 ms | 86 ms |
+| 128k | 79 ms | 154 ms | 283 ms | 803 ms |
+
+**Smaller caches run slower here, not faster.** fp32 reads its cache at 11-15 GB/s (copy bandwidth is
+22 GB/s), so it is close to memory bound. Every other format first converts the block to a new fp32
+tensor in memory, then multiplies by the scale into another one, so it ends up moving more bytes than
+the fp32 path, plus doing the unpacking on the CPU's vector units. Int4 is about 10x slower than fp32.
+
+So the byte savings in the roofline only show up if dequant is fused into the attention kernel and
+stays in registers, and if the vector units can keep up (the same thing the NPU sweep shows).
+
 ## Tests
 
 ```
@@ -188,6 +227,10 @@ the step goes from 21% to 35% (`multichip_breakdown.png`, `multichip_link_share.
 sends its partial once and the latency is two hops instead of 2(N-1). All-reduce time drops from
 4.8 ms to 0.8 ms and the step goes from 13.5 ms to 9.6 ms. Decode all-reduces are tiny (32 x 8192 x 2 B),
 so this is mostly a latency win; compressing activations to int8 on top only saves another 0.1 ms.
+
+The 2 us per hop is a guess, so `multichip_latency_sweep.png` sweeps it from 0.25 to 10 us. At 0.5 us
+in-network saves 1.1 ms per step (10.2 vs 9.1 ms), at 5 us it saves 9.7 ms (20.3 vs 10.5 ms). The
+ordering never flips, only the size of the win.
 
 **KV heads run out.** Llama-2-70B has 8 KV heads, so past 8 chips each KV head gets copied and
 per-chip KV traffic stops shrinking. Going from 8 to 32 chips only speeds up a 32k step from
