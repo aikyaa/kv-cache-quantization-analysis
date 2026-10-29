@@ -93,11 +93,11 @@ if __name__ == "__main__":
             c, nbytes = make_cache(L, fmt)
             attention(q, c, fmt, L)
             times = []
-            for _ in range(7):
+            for _ in range(15):
                 t0 = time.perf_counter()
                 attention(q, c, fmt, L)
                 times.append(time.perf_counter() - t0)
-            best = sorted(times)[3]
+            best = min(times)
             if fmt == "fp32":
                 ref = best
             rows.append(dict(ctx=L, kv=fmt, MB=nbytes / 1e6, ms=best * 1e3,
