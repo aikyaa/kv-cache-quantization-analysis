@@ -190,21 +190,63 @@ dequantized one 4096-token block at a time in plain PyTorch. 4 threads, median o
 
 | ctx | fp32 | fp16 | int8 | int4 |
 |---|---|---|---|---|
-| 16k | 12 ms | 34 ms | 40 ms | 86 ms |
-| 128k | 79 ms | 154 ms | 283 ms | 803 ms |
+| 16k | 4.6 ms | 11.4 ms | 18.1 ms | 46.0 ms |
+| 128k | 42.8 ms | 102.3 ms | 176.8 ms | 414.2 ms |
 
-**Smaller caches run slower here, not faster.** fp32 reads its cache at 11-15 GB/s (copy bandwidth is
-22 GB/s), so it is close to memory bound. Every other format first converts the block to a new fp32
-tensor in memory, then multiplies by the scale into another one, so it ends up moving more bytes than
-the fp32 path, plus doing the unpacking on the CPU's vector units. Int4 is about 10x slower than fp32.
+(best of 15 runs; the laptop was on battery and the median moved around by 2-4x between runs)
 
-So the byte savings in the roofline only show up if dequant is fused into the attention kernel and
-stays in registers, and if the vector units can keep up (the same thing the NPU sweep shows).
+**Smaller caches run slower here, not faster.** fp32 reads its cache at 25-30 GB/s, about the copy
+bandwidth, so it is memory bound. Every other format first converts the block to a new fp32 tensor in
+memory, then multiplies by the scale into another one, so it ends up moving more bytes than the fp32
+path, plus doing the unpacking on the CPU's vector units. Int4 is about 10x slower than fp32.
+
+`fused_bench.py` does the same attention as a numba kernel where each cache row is dequantized
+into a 128-float buffer that stays in L1, then used right away:
+
+| ctx | fp32 | int8 | int4 |
+|---|---|---|---|
+| 16k | 3.5 ms | 2.4 ms (1.46x) | 2.6 ms (1.37x) |
+| 64k | 15.8 ms | 11.6 ms (1.36x) | 18.2 ms (0.87x) |
+| 128k | 32.2 ms | 22.0 ms (1.47x) | 40.7 ms (0.79x) |
+
+Now int8 beats fp32, but only by ~1.4x, not the 3.9x the byte savings would give: int8 runs at
+12-14 GB/s of cache, so the CPU's arithmetic is the limit now, not memory. Int4 is worse because
+unpacking nibbles costs more per value. Another run of the same script gave int8 2.7x and int4 1.5-1.7x
+at 16k-64k, so the exact numbers are noisy, but fused int8 was faster than fp32 in every run and
+unfused never was (`fused_vs_unfused.png`).
+
+So the byte savings in the roofline only show up if dequant is fused into the attention kernel, and
+even then only as far as the vector units keep up. That is the same thing the NPU sweep predicts.
+
+## KIVI-style keys in a real decode loop
+
+The per-channel key numbers above come from a full-sequence pass, which is slightly off for decode:
+a group of 32 keys can only be quantized per channel once all 32 tokens exist. `kivi.py` runs GPT-2
+token by token, quantizes a key group only once it is full and older than a fp16 residual window, and
+keeps the newest tokens in fp16 (`quantize_kivi` in `quant.py`). Values stay per-token. 4 chunks of 512 tokens:
+
+| KV | ppl (token by token) | key bytes/value at 32k |
+|---|---|---|
+| fp16 | 34.18 | 2.0 |
+| int4 per-token g32 | 34.72 | 0.625 |
+| int4 kivi, residual 0 | 34.30 | 0.625 |
+| int4 kivi, residual 32 | 34.21 | 0.626 |
+| int4 kivi, residual 128 | 34.26 | 0.630 |
+| int2 per-token g32 | 129.3 | 0.375 |
+| int2 kivi, residual 0 | 38.09 | 0.375 |
+| int2 kivi, residual 32 | 37.90 | 0.377 |
+| int2 kivi, residual 128 | 37.49 | 0.381 |
+
+Per-channel keys still win by a lot when done properly in decode, and a small fp16 window helps a
+little more. The window is free at long context (128 fp16 tokens out of 32k barely changes the bytes),
+but at 512 tokens a 128 window is a quarter of the cache, so it matters most for short prompts.
 
 ## Tests
 
 ```
 python -m pytest
+python run_all.py          # everything fast
+python run_all.py --all    # also the simulator and perplexity runs, a few hours
 ```
 
 Checks the byte counts against hand math, that the crossover batch really balances compute and

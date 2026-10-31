@@ -1,0 +1,10 @@
+kv,ppl_decode,key_bytes_per_value_at_512,key_bytes_per_value_at_32k
+fp16,34.1756,2.0000,2.0000
+int4 per-token,34.7188,0.6250,0.6250
+"int4 kivi, residual 0",34.3044,0.6250,0.6250
+"int4 kivi, residual 32",34.2116,0.7109,0.6263
+"int4 kivi, residual 128",34.2600,0.9688,0.6304
+int2 per-token,129.2983,0.3750,0.3750
+"int2 kivi, residual 0",38.0932,0.3750,0.3750
+"int2 kivi, residual 32",37.8970,0.4766,0.3766
+"int2 kivi, residual 128",37.4931,0.7812,0.3813

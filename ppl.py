@@ -7,14 +7,17 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, AttentionInterface
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
-from quant import quantize_kv
+from quant import quantize_kv, quantize_kivi
 
 # current kv setting, changed between runs
 setting = {}
 
 
 def kvquant_attention(module, query, key, value, attention_mask, **kwargs):
-    if setting:
+    if setting and setting["k_axis"] == "kivi":
+        key = quantize_kivi(key, setting["k_bits"], setting["k_group"], setting["residual"])
+        value = quantize_kv(value, setting["v_bits"], setting["v_group"], "token")
+    elif setting:
         key = quantize_kv(key, setting["k_bits"], setting["k_group"], setting["k_axis"])
         value = quantize_kv(value, setting["v_bits"], setting["v_group"], "token")
     return sdpa_attention_forward(module, query, key, value, attention_mask, **kwargs)

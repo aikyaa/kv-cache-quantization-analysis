@@ -38,6 +38,18 @@ def quantize_kv(x, bits, group, axis="token", sym=False):
     return out.transpose(2, 3).to(x.dtype)
 
 
+def quantize_kivi(x, bits, group, residual):
+    # keys per channel, but only groups that are full and older than the residual window
+    # the newest tokens stay fp16 until their group fills up
+    T = x.shape[2]
+    n = max(T - residual, 0) // group * group
+    if n == 0:
+        return x.half().to(x.dtype)
+    old = quantize_kv(x[:, :, :n], bits, group, axis="channel")
+    new = x[:, :, n:].half().to(x.dtype)
+    return torch.cat([old, new], dim=2)
+
+
 def pack_int4(x, group):
     # real int4 storage: two values per byte + fp16 scale and min per group
     shape = x.shape
