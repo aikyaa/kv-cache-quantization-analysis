@@ -186,7 +186,7 @@ much harsher metric than perplexity.
 
 `cpu_bench.py` runs flash-decoding style attention for one Llama-3-8B layer (8 KV heads, 4 query
 heads each) on this laptop's CPU, with the cache stored as fp32, fp16, int8 or packed int4 and
-dequantized one 4096-token block at a time in plain PyTorch. 4 threads, median of 7 runs.
+dequantized one 4096-token block at a time in plain PyTorch, 4 threads.
 
 | ctx | fp32 | fp16 | int8 | int4 |
 |---|---|---|---|---|
