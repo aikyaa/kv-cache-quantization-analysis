@@ -1,0 +1,5 @@
+model,kv,ppl
+gpt2,fp8 e4m3,31.2773
+gpt2,fp8 e4m3 per-token scale,31.2542
+gpt2,fp8 e5m2,31.7106
+gpt2,fp8 e5m2 per-token scale,31.5304

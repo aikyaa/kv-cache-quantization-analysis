@@ -50,6 +50,16 @@ def quantize_kivi(x, bits, group, residual):
     return torch.cat([old, new], dim=2)
 
 
+def quantize_fp8(x, fmt="e4m3", scaled=False):
+    # cast to fp8 and back. scaled = one fp16 scale per token so the max lands on the fp8 max
+    dt = torch.float8_e4m3fn if fmt == "e4m3" else torch.float8_e5m2
+    if not scaled:
+        return x.to(dt).to(x.dtype)
+    fmax = torch.finfo(dt).max
+    scale = (x.abs().amax(dim=-1, keepdim=True) / fmax).clamp(min=1e-8)
+    return ((x / scale).to(dt).to(x.dtype) * scale).to(x.dtype)
+
+
 def pack_int4(x, group):
     # real int4 storage: two values per byte + fp16 scale and min per group
     shape = x.shape

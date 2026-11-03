@@ -13,6 +13,7 @@ fast = [
     ["quant.py"],
     ["cpu_bench.py"],
     ["fused_bench.py"],
+    ["fp8.py"],
     ["-m", "pytest", "-q"],
 ]
 
@@ -25,6 +26,7 @@ slow = [
     ["plot_ppl.py"],
     ["decode_check.py"],
     ["kivi.py"],
+    ["fp8.py", "--ppl"],
 ]
 
 steps = fast + slow if "--all" in sys.argv else fast
