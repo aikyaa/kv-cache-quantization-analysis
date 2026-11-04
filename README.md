@@ -241,16 +241,28 @@ Per-channel keys still win by a lot when done properly in decode, and a small fp
 little more. The window is free at long context (128 fp16 tokens out of 32k barely changes the bytes),
 but at 512 tokens a 128 window is a quarter of the cache, so it matters most for short prompts.
 
-## Tests
+## FP8 instead of integers
 
-```
-python -m pytest
-python run_all.py          # everything fast
-python run_all.py --all    # also the simulator and perplexity runs, a few hours
-```
+`fp8.py` adds an fp8 KV cache: 1 byte per value with no group scales, which Hopper-class chips
+can read natively, so dequant is a single convert.
 
-Checks the byte counts against hand math, that the crossover batch really balances compute and
-memory time, the all-reduce byte counts, and that int4 packing round trips.
+| KV | bytes/value | step speedup at 32k, batch 16 (Llama-3-8B) | GPT-2 ppl |
+|---|---|---|---|
+| fp16 | 2.0 | 1.00x | 31.17 |
+| fp8 e4m3 | 1.0 | 1.70x | 31.28 |
+| fp8 e4m3, per-token scale | ~1.0 | 1.70x | 31.25 |
+| fp8 e5m2 | 1.0 | 1.70x | 31.71 |
+| int8 g64 | 1.06 | 1.68x | 31.17 |
+| int4 K per-channel | 0.59 | 2.44x | 31.28 |
+
+(The speedup column uses the roofline's int8 g128 and int4 g64 formats; the ppl column uses the
+formats named in the row, so bytes differ slightly.)
+
+Fp8 and int8 move the same bytes, but int8 with group scales is more accurate (3 mantissa bits in
+e4m3 vs 8 bits inside a tight range). e4m3 costs about as much accuracy as int4 with per-channel keys,
+which moves 40% fewer bytes. Fp8's real advantage is hardware support, not accuracy or traffic.
+e5m2 trades mantissa for range the KV cache doesn't need. Tables: `results/fp8_roofline.csv`,
+`results/ppl_gpt2_fp8.csv`.
 
 ## Multi-chip
 
@@ -284,3 +296,27 @@ fp16 and 3.0 GB in int4, i.e. 24 ms vs 6.7 ms over NVLink or 0.86 s vs 0.24 s ov
 
 Context-parallel decode (splitting the cache along the sequence) would need a softmax-aware
 combine (max, then rescaled sum), which plain sum/max in-switch reduction can only do in two passes.
+
+## Limitations
+
+- The roofline uses peak datasheet numbers and assumes compute, memory and links overlap perfectly.
+  No paged-attention overhead, no kernel launch costs, no prefill.
+- SCALE-Sim models one array with no data types; narrow KV is faked by giving it more words per cycle.
+- Perplexity is on WikiText-2 only, 64k tokens for GPT-2 and 16k for TinyLlama. Long-context
+  quality (where KV quantization matters most) isn't measured, the models here only see 1-2k tokens.
+- CPU timings were taken on battery and move around a lot between runs; the trends held, the exact
+  speedups didn't.
+- The multi-chip model is analytical: the 2 us hop latency is a guess (swept above), there is no
+  congestion, and the in-network reduction is idealized.
+
+## Tests and rerunning
+
+```
+python -m pytest
+python run_all.py          # everything fast
+python run_all.py --all    # also the simulator and perplexity runs, a few hours
+```
+
+Checks the byte counts against hand math, that the crossover batch really balances compute and
+memory time, the all-reduce byte counts, and that int4 packing round trips.
+
