@@ -6,6 +6,39 @@ compute bound?
 
 Everything runs on a laptop CPU with free Python packages.
 
+## Summary
+
+- **Decode is memory bound almost everywhere.** Attention has no data reuse across a batch, so the
+  whole step is only compute bound at short context: below ~760 tokens for Llama-3-8B on an A100 with
+  fp16 KV. Int8 KV doubles that, int4 roughly quadruples it.
+- **KV quantization is a long-context win.** Int4 KV speeds up a Llama-3-8B decode step 1.1x at 1k
+  context and 3.1x at 128k (batch 16, roofline).
+- **Accuracy is fine down to int4 if keys are scaled per channel.** Int8 is free, int4 with per-channel
+  keys costs +0.1 ppl on GPT-2 and +0.05 on TinyLlama while moving 30% of the fp16 bytes. Per-token
+  int2 breaks (ppl 162), per-channel int2 is usable (37).
+- **The savings need the right hardware and kernels.** A weight-stationary systolic array (SCALE-Sim)
+  is bound by array fill and drain at decode batch sizes and gets no speedup from smaller KV. On a CPU,
+  unfused dequant makes int4 10x slower than fp32; a fused kernel makes int8 faster than fp32, but the
+  vector units still cap the gain.
+- **Across chips, compressing KV shifts the bottleneck to the interconnect.** In-network reduction
+  brings it back down, and past the number of KV heads, int4 KV helps more than adding chips.
+
+## Files
+
+| file | what it does |
+|---|---|
+| `roofline.py` | model/hardware specs, bytes and flops per decode step, crossover math |
+| `plots.py` | roofline figures and tables |
+| `simulate.py`, `crosscheck.py`, `compare_sim.py`, `dataflow.py` | SCALE-Sim runs and comparison |
+| `quant.py` | int/fp8 fake quantization, KIVI keys, real int4 packing |
+| `ppl.py`, `plot_ppl.py` | perplexity with a quantized-KV attention hook |
+| `decode_check.py`, `kivi.py` | token-by-token decode checks |
+| `fp8.py` | fp8 KV roofline and perplexity |
+| `cpu_bench.py`, `fused_bench.py` | real CPU attention, unfused PyTorch vs fused numba |
+| `multichip.py` | tensor parallel, all-reduce and KV migration model |
+| `run_all.py` | reruns everything |
+| `tests/` | pytest checks |
+
 ```
 python -m venv .venv
 .venv/Scripts/python -m pip install -r requirements.txt
