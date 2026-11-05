@@ -1,89 +1,51 @@
 # KV-cache quantization for LLM decode
 
-Question: for decode attention, how much do INT8/INT4 KV caches cut memory traffic,
-and at what context length and batch size does decode go from memory bound to
-compute bound?
-
-Everything runs on a laptop CPU with free Python packages.
-
-## Summary
-
-- **Decode is memory bound almost everywhere.** Attention has no data reuse across a batch, so the
-  whole step is only compute bound at short context: below ~760 tokens for Llama-3-8B on an A100 with
-  fp16 KV. Int8 KV doubles that, int4 roughly quadruples it.
-- **KV quantization is a long-context win.** Int4 KV speeds up a Llama-3-8B decode step 1.1x at 1k
-  context and 3.1x at 128k (batch 16, roofline).
-- **Accuracy is fine down to int4 if keys are scaled per channel.** Int8 is free, int4 with per-channel
-  keys costs +0.1 ppl on GPT-2 and +0.05 on TinyLlama while moving 30% of the fp16 bytes. Per-token
-  int2 breaks (ppl 162), per-channel int2 is usable (37).
-- **The savings need the right hardware and kernels.** A weight-stationary systolic array (SCALE-Sim)
-  is bound by array fill and drain at decode batch sizes and gets no speedup from smaller KV. On a CPU,
-  unfused dequant makes int4 10x slower than fp32; a fused kernel makes int8 faster than fp32, but the
-  vector units still cap the gain.
-- **Across chips, compressing KV shifts the bottleneck to the interconnect.** In-network reduction
-  brings it back down, and past the number of KV heads, int4 KV helps more than adding chips.
-
-## Files
-
-| file | what it does |
-|---|---|
-| `roofline.py` | model/hardware specs, bytes and flops per decode step, crossover math |
-| `plots.py` | roofline figures and tables |
-| `simulate.py`, `crosscheck.py`, `compare_sim.py`, `dataflow.py` | SCALE-Sim runs and comparison |
-| `quant.py` | int/fp8 fake quantization, KIVI keys, real int4 packing |
-| `ppl.py`, `plot_ppl.py` | perplexity with a quantized-KV attention hook |
-| `decode_check.py`, `kivi.py` | token-by-token decode checks |
-| `fp8.py` | fp8 KV roofline and perplexity |
-| `cpu_bench.py`, `fused_bench.py` | real CPU attention, unfused PyTorch vs fused numba |
-| `multichip.py` | tensor parallel, all-reduce and KV migration model |
-| `run_all.py` | reruns everything |
-| `tests/` | pytest checks |
+How much do INT8/INT4 KV caches cut memory traffic during decode, and at what context length
+and batch size does decode stop being memory bound? Everything here runs on a laptop CPU.
 
 ```
 python -m venv .venv
 .venv/Scripts/python -m pip install -r requirements.txt
+python run_all.py          # fast parts, ~5 min
+python run_all.py --all    # plus simulator and perplexity runs, a few hours
 ```
+
+## Summary
+
+- Decode is memory bound almost everywhere. For Llama-3-8B on an A100 with fp16 KV, no batch size
+  is compute bound past ~760 tokens of context. INT8 KV doubles that, INT4 roughly quadruples it.
+- INT4 KV speeds up a decode step 1.1x at 1k context and 3.1x at 128k (Llama-3-8B, batch 16, roofline).
+- INT8 KV costs no accuracy. INT4 costs +0.1 ppl if keys are quantized per channel, +1.1 if per token.
+- A weight-stationary systolic array (SCALE-Sim) gets no speedup from smaller KV at decode batch
+  sizes, because array fill/drain dominates, not DRAM.
+- On a CPU the gain only shows up with a fused dequant kernel, and even then the vector units cap it.
+- Across chips, compressing KV makes the all-reduces a bigger share of the step. In-network
+  reduction fixes most of that.
 
 ## Roofline model
 
-`roofline.py` counts bytes and flops for one decode step, `plots.py` makes the figures
-and tables in `results/`.
+`roofline.py` counts bytes and FLOPs for one decode step (batch B, context L):
 
-```
-python roofline.py
-python plots.py
-```
+- weights: 2 B/param, read once per step and shared by the batch
+- KV: B x (L+1) x bytes per token
+- FLOPs: 2 x params x B (linear) + 4 x layers x heads x head_dim x L x B (attention)
+- vector ops: dequant of every KV value read, plus softmax
 
-What the model counts per decode step (batch B, context L):
+| KV format | bytes/value |
+|---|---|
+| fp16 | 2.0 |
+| int8, g128, scale only | 1.016 |
+| int4, g64, scale + zero | 0.5625 |
 
-- weights: 2 bytes x params, read once and shared by the whole batch
-- KV cache: B x (L+1) x bytes per token (read the cache, write the new token)
-- flops: 2 x params x B for the linear layers, 4 x layers x heads x head_dim x L x B for attention
-- vector ops: dequantizing every KV value read, plus softmax
+Hardware: A100 (312 TFLOP/s, 2.0 TB/s), H100 (989 TFLOP/s, 3.35 TB/s) and a made-up NPU
+(200 TFLOP/s, 0.8 TB/s, 4 TFLOP/s vector).
 
-KV formats (scales and zero points are counted as traffic):
+Attention on its own is never compute bound. Each sequence has its own cache, so batching gives
+no reuse, and the intensity is just `2 x gqa_group / bytes_per_value`: 1 FLOP/B for Llama-2-7B in fp16,
+14 for Llama-3-8B in int4, against ridge points of 153 (A100) and 295 (H100).
 
-| format | bits | group | bytes/value |
-|---|---|---|---|
-| fp16 | 16 | - | 2.0 |
-| int8 | 8 | 128, scale only | 1.016 |
-| int4 | 4 | 64, scale + zero | 0.5625 |
-
-Hardware is the public peak spec (dense fp16): A100 (312 TFLOP/s, 2.0 TB/s),
-H100 (989 TFLOP/s, 3.35 TB/s), and a made up NPU (200 TFLOP/s, 0.8 TB/s, only 4 TFLOP/s of vector compute).
-
-### Findings
-
-**KV per token** (all layers): Llama-2-7B 512 KB in fp16 (MHA), Llama-3-8B 128 KB (GQA 4x),
-Llama-3.2-1B 32 KB. INT4 cuts that to ~0.28x, not 0.25x, because of the group metadata.
-
-**Attention alone never becomes compute bound.** Each sequence has its own cache, so batching
-gives attention no data reuse. Its intensity is `2 x gqa_group / bytes_per_value`:
-1 flop/byte for Llama-2 fp16, 14 for Llama-3-8B int4. The A100 ridge is 153 and the H100 ridge is 295.
-
-**The whole step is only compute bound at short context.** Weights get reused across the batch
-but KV doesn't, so as L grows the step slides back to memory bound no matter how big the batch is.
-The context above which no batch size is compute bound:
+The full step can be compute bound because weights are shared across the batch, but only at short
+context. Context above which no batch is compute bound:
 
 | model | hw | fp16 | int8 | int4 |
 |---|---|---|---|---|
@@ -92,264 +54,159 @@ The context above which no batch size is compute bound:
 | Llama-3-8B | H100 | 384 | 768 | 1418 |
 | Llama-3.2-1B | A100 | 497 | 1006 | 1900 |
 
-So KV quantization roughly doubles (int8) or quadruples (int4) the context where compute
-bound is even possible. Even then you need a batch of a few hundred, and memory capacity
-caps the batch first in most of that region (dashed lines in `bound_map.png`).
-On H100 the ridge is higher, so decode is memory bound at even shorter contexts.
+Inside that region you still need a batch of a few hundred, and memory capacity usually runs out
+first (`bound_map.png`).
 
-**Speedup is a long-context thing.** At batch 16 on Llama-3-8B, int4 KV gives ~1.1x at 1k
-context (weights dominate) and 2x by 16k, approaching 3.1x at 128k (`speedup.png`).
+INT4 KV per token is 0.28x of fp16, not 0.25x, because of the scales. The step speedup grows with
+context since weights dominate at short context: 1.1x at 1k, 2x at 16k, 3.1x at 128k (`speedup.png`).
 
-**Dequant isn't free on a weak vector unit.** Int4 reads 0.56 bytes per value but costs ~3
-vector ops to unpack and scale. On the NPU at 32k context, int4 loses its whole speedup once
-vector throughput drops below ~2.5 TFLOP/s, and below ~1.7 TFLOP/s int8 beats int4
-(`npu_vector_sweep.png`).
+Dequant cost matters on a weak vector unit. INT4 needs ~3 vector ops per value. On the NPU at 32k
+context, INT4 loses its whole speedup below ~2.5 TFLOP/s of vector compute, and below ~1.7 INT8
+is faster than INT4 (`npu_vector_sweep.png`).
 
-Figures: `results/figures/bytes_per_step.png`, `bound_map.png`, `speedup.png`,
-`roofline_a100.png`, `npu_vector_sweep.png`. Tables: `results/decode_steps.csv`, `results/crossover.csv`.
+## SCALE-Sim cross-check
 
-## Cross-check with SCALE-Sim
+`crosscheck.py` runs every GEMM of one Llama-3.2-1B layer through SCALE-Sim (128x128 array, 1 GHz,
+512 B/cycle, 32 MB SRAM) for batch 1/16/64, context 512/2k/8k and each KV format. SCALE-Sim has no
+data types, so narrow KV is modeled as more words per cycle. `compare_sim.py` compares against
+the roofline.
 
-`simulate.py` wraps SCALE-Sim for one GEMM, `crosscheck.py` runs every GEMM of one
-Llama-3.2-1B decoder layer (batch 1/16/64, context 512/2k/8k, fp16/int8/int4 KV) and
-`compare_sim.py` lines them up against the roofline.
+They disagree a lot:
 
-```
-python crosscheck.py   # ~30 min on 10 cores
-python compare_sim.py
-```
+- SCALE-Sim is 6-35x slower than the roofline. Decode GEMMs have tiny M (batch for linear layers,
+  GQA group of 4 for attention), and a weight-stationary array pays a load, stream and drain for every
+  128x128 weight tile regardless of M. Cycles match `folds x (2*rows + cols + M - 2)` to within one
+  cycle on every GEMM that doesn't stall.
+- It shows no speedup from INT4 KV (roofline: 1.9x at batch 16, 8k). The array never waits on DRAM.
+- It counts traffic the roofline ignores: partial sums written out after each K fold (16-64x the
+  output size), PV reading its filter twice (N=64 fills half the columns), and up/gate weights that
+  don't fit in SRAM and get fetched twice.
 
-Simulated chip: 128x128 weight-stationary array at 1 GHz, 512 B/cycle off chip, 32 MB SRAM.
-SCALE-Sim has no data types, so narrow KV is modeled by giving the attention GEMMs more
-words per cycle (512 / bytes per value, rounded down to a multiple of 64).
+Dataflow explains most of the gap (`dataflow.py`, cycles):
 
-### Where they disagree
+| GEMM | roofline | ws | os | is |
+|---|---|---|---|---|
+| qkv, batch 1 | 24,596 | 147,100 | 55,247 | 55,263 |
+| qkv, batch 64 | 25,856 | 171,300 | 55,247 | 55,263 |
+| down, batch 16 | 66,176 | 407,600 | 135,135 | 155,519 |
+| QK, fp16, 2k | 545 | 6,175 | 5,087 | 2,429 |
+| QK, int4, 2k | 180 | 6,175 | 5,087 | 2,429 |
+| PV, fp16, 2k | 545 | 6,175 | 2,301 | 7,135 |
 
-**SCALE-Sim is 6-35x slower than the roofline** (`scalesim_vs_roofline.png`). Decode GEMMs have
-tiny M (the batch for linear layers, the GQA group of 4 for attention), and on a weight-stationary
-array every 128x128 weight tile costs a load, a stream and a drain regardless of M. The cycle count
-matches `folds x (2 x rows + cols + M - 2)` to within one cycle for every GEMM that doesn't stall.
-The roofline assumes peak MACs, which an array can't reach unless M is about as big as the array.
+Output/input stationary gets linear layers to ~2x the roofline and attention to ~4.3x. Batch 1 and
+64 cost the same, so any batch up to 128 is free on this array. INT4 still doesn't help.
 
-**SCALE-Sim sees no speedup from KV quantization.** With enough bandwidth the array never stalls on
-DRAM, so cutting KV bytes changes nothing. Roofline says int4 is 1.9x faster at batch 16 and 8k context;
-SCALE-Sim says 1.0x. On this kind of chip decode is bound by array fill and drain, not memory,
-so KV compression only pays off once the array is sized or mapped for small M.
+## Accuracy
 
-**Extra DRAM traffic the roofline doesn't count:**
-- partial sums go out to DRAM after every K fold (ofmap writes 16-64x the output size)
-- PV re-reads its filter twice (N = 64 fills only half the array's columns)
-- the up/gate weights (2048 x 16384) don't fit in SRAM, so they're fetched twice and the array stalls
-
-**The dataflow is most of the gap.** `dataflow.py` reruns some of the GEMMs as output stationary (os)
-and input stationary (is):
-
-| gemm | roofline | ws | os | is | best / roofline |
-|---|---|---|---|---|---|
-| qkv, batch 1 | 24,596 | 147,100 | 55,247 | 55,263 | 2.2 |
-| qkv, batch 64 | 25,856 | 171,300 | 55,247 | 55,263 | 2.1 |
-| down, batch 16 | 66,176 | 407,600 | 135,135 | 155,519 | 2.0 |
-| QK, fp16, 2k | 545 | 6,175 | 5,087 | 2,429 | 4.5 |
-| QK, int4, 2k | 180 | 6,175 | 5,087 | 2,429 | 13.5 |
-| PV, fp16, 2k | 545 | 6,175 | 2,301 | 7,135 | 4.2 |
-| PV, int4, 2k | 180 | 6,175 | 2,301 | 7,135 | 12.8 |
-
-Weight stationary is the worst choice for decode: it reloads the array for every weight tile and
-then only streams M rows through it. Output stationary streams K through the array instead, which
-cuts linear layers to about 2x the roofline. Batch 1 and batch 64 take the same cycles, so on this
-array any batch up to 128 is free. Even the best dataflow still shows no gain from int4 KV, since
-the array, not DRAM, is what sets the time.
-
-Tables: `results/scalesim_runs.csv`, `scalesim_compare.csv`, `scalesim_layer_steps.csv`,
-`scalesim_dataflows.csv`.
-
-## Accuracy cost
-
-`quant.py` does group-wise fake quantization plus real int4 packing (two values per byte with an
-fp16 scale and min per group; it measures out to exactly 0.5625 bytes per value, same as the roofline
-assumes). `ppl.py` plugs it into GPT-2's attention through a custom attention function, so the
-keys and values every query sees are quantized.
-
-```
-python ppl.py gpt2 1024 65536
-python plot_ppl.py
-```
-
-WikiText-2 test. GPT-2 small (12 heads, MHA): first 64k tokens, 1024 token windows.
-TinyLlama-1.1B (32 query heads, 4 KV heads): first 16k tokens, 2048 token windows.
+`quant.py` does group-wise fake quantization and real int4 packing (measures 0.5625 B/value, same
+as the roofline). `ppl.py` hooks it into the model's attention. WikiText-2 test; GPT-2 on 64k tokens,
+TinyLlama-1.1B (4 KV heads) on 16k.
 
 | KV | bytes vs fp16 | GPT-2 | TinyLlama |
 |---|---|---|---|
 | fp16 | 1.00 | 31.17 | 7.178 |
 | int8 g64 | 0.53 | 31.17 | 7.179 |
 | K int8, V int4 | 0.41 | 31.23 | 7.200 |
-| int4 K per-channel, V per-token | 0.30 | 31.28 | 7.233 |
+| int4, K per-channel | 0.30 | 31.28 | 7.233 |
 | int4 g32 | 0.31 | 31.98 | 7.317 |
 | K int4, V int8 | 0.41 | 32.24 | 7.383 |
 | int4 g64 | 0.28 | 32.32 | 7.401 |
-| int2 K per-channel | 0.19 | 37.34 | 9.592 |
+| int2, K per-channel | 0.19 | 37.34 | 9.592 |
 | int3 g32 | 0.25 | 37.96 | 7.849 |
 | int2 g32 | 0.19 | 162.1 | 37.46 |
+| fp8 e4m3 | 0.50 | 31.28 | - |
+| fp8 e5m2 | 0.50 | 31.71 | - |
 
-- int8 is free.
-- Keys are the sensitive half: int4 keys cost +1.1 ppl, int4 values only +0.06.
-- Grouping keys per channel instead of per token (the KIVI trick) gets int4 to +0.1 ppl,
-  and takes int2 from 162 to 37, because a few key channels have much larger outliers than the rest.
-- So int4 with per-channel keys moves 30% of the fp16 bytes for almost no accuracy loss.
-  Both models agree on the ordering, so this isn't a GPT-2 quirk.
+Keys are the sensitive part: int4 keys cost +1.1 ppl on GPT-2, int4 values +0.06. A few key channels
+carry large outliers, so per-channel scales for keys fix most of it and take int2 from 162 to 37.
+Both models give the same ordering.
 
-`decode_check.py` runs GPT-2 token by token with a real KV cache to make sure the full-sequence
-numbers above are what decode actually sees (4 chunks of 512 tokens, `results/decode_check.csv`):
+FP8 moves the same bytes as int8 but is less accurate (e4m3 has 3 mantissa bits). Its advantage is
+native hardware support, not traffic or accuracy (`fp8.py`).
 
-| KV | ppl full sequence | ppl token by token | greedy tokens same as fp16 |
-|---|---|---|---|
-| fp16 | 34.18 | 34.18 | 100% |
-| int8 g64 | 34.16 | 34.16 | 76% |
-| int4 K per-channel | 34.26 | 34.20 | 57% |
-| int4 g64 | 35.04 | 35.07 | 16% |
-| int2 g32 | 127.7 | 129.3 | 4% |
+The numbers above come from full-sequence passes. `decode_check.py` reruns GPT-2 token by token
+with a real cache and gets the same perplexity to within 0.1% for per-token formats, since re-quantizing
+an already quantized token gives the same values. Greedy outputs drift much faster than perplexity:
+int8 matches fp16 on 76% of generated tokens, int4 g64 on 16%.
 
-Per-token quantization is idempotent, so re-quantizing the cache every step gives the same
-numbers as storing it quantized. Per-channel keys differ a little because their groups run
-along tokens and change as the cache grows. Greedy outputs drift apart even when perplexity
-doesn't move: one different token early on changes everything after it, so token match is a
-much harsher metric than perplexity.
+Per-channel keys can't really be quantized in decode until their group of 32 tokens is complete.
+`kivi.py` does it properly (quantize full groups only, keep the newest tokens in fp16):
 
-## Real CPU check
+| KV | ppl, token by token |
+|---|---|
+| fp16 | 34.18 |
+| int4 per-token | 34.72 |
+| int4 KIVI, fp16 window 32 | 34.21 |
+| int2 per-token | 129.3 |
+| int2 KIVI, fp16 window 128 | 37.49 |
 
-`cpu_bench.py` runs flash-decoding style attention for one Llama-3-8B layer (8 KV heads, 4 query
-heads each) on this laptop's CPU, with the cache stored as fp32, fp16, int8 or packed int4 and
-dequantized one 4096-token block at a time in plain PyTorch, 4 threads.
+The fp16 window adds almost nothing at long context (128 tokens out of 32k).
 
-| ctx | fp32 | fp16 | int8 | int4 |
-|---|---|---|---|---|
-| 16k | 4.6 ms | 11.4 ms | 18.1 ms | 46.0 ms |
-| 128k | 42.8 ms | 102.3 ms | 176.8 ms | 414.2 ms |
+## CPU check
 
-(best of 15 runs; the laptop was on battery and the median moved around by 2-4x between runs)
+`cpu_bench.py` runs decode attention for one Llama-3-8B layer on this laptop, dequantizing one
+4096-token block at a time in PyTorch. `fused_bench.py` does the same in numba, dequantizing each
+row into a small buffer that stays in L1. Best of 15 runs; the laptop was on battery and timings
+moved 2-4x between runs.
 
-**Smaller caches run slower here, not faster.** fp32 reads its cache at 25-30 GB/s, about the copy
-bandwidth, so it is memory bound. Every other format first converts the block to a new fp32 tensor in
-memory, then multiplies by the scale into another one, so it ends up moving more bytes than the fp32
-path, plus doing the unpacking on the CPU's vector units. Int4 is about 10x slower than fp32.
+| ctx | fp32 | int8 unfused | int4 unfused | int8 fused | int4 fused |
+|---|---|---|---|---|---|
+| 16k | 4.6 ms | 18.1 ms | 46.0 ms | 2.4 ms | 2.6 ms |
+| 128k | 42.8 ms | 176.8 ms | 414.2 ms | 22.0 ms | 40.7 ms |
 
-`fused_bench.py` does the same attention as a numba kernel where each cache row is dequantized
-into a 128-float buffer that stays in L1, then used right away:
+(fused fp32: 3.5 ms at 16k, 32.2 ms at 128k)
 
-| ctx | fp32 | int8 | int4 |
-|---|---|---|---|
-| 16k | 3.5 ms | 2.4 ms (1.46x) | 2.6 ms (1.37x) |
-| 64k | 15.8 ms | 11.6 ms (1.36x) | 18.2 ms (0.87x) |
-| 128k | 32.2 ms | 22.0 ms (1.47x) | 40.7 ms (0.79x) |
-
-Now int8 beats fp32, but only by ~1.4x, not the 3.9x the byte savings would give: int8 runs at
-12-14 GB/s of cache, so the CPU's arithmetic is the limit now, not memory. Int4 is worse because
-unpacking nibbles costs more per value. Another run of the same script gave int8 2.7x and int4 1.5-1.7x
-at 16k-64k, so the exact numbers are noisy, but fused int8 was faster than fp32 in every run and
-unfused never was (`fused_vs_unfused.png`).
-
-So the byte savings in the roofline only show up if dequant is fused into the attention kernel, and
-even then only as far as the vector units keep up. That is the same thing the NPU sweep predicts.
-
-## KIVI-style keys in a real decode loop
-
-The per-channel key numbers above come from a full-sequence pass, which is slightly off for decode:
-a group of 32 keys can only be quantized per channel once all 32 tokens exist. `kivi.py` runs GPT-2
-token by token, quantizes a key group only once it is full and older than a fp16 residual window, and
-keeps the newest tokens in fp16 (`quantize_kivi` in `quant.py`). Values stay per-token. 4 chunks of 512 tokens:
-
-| KV | ppl (token by token) | key bytes/value at 32k |
-|---|---|---|
-| fp16 | 34.18 | 2.0 |
-| int4 per-token g32 | 34.72 | 0.625 |
-| int4 kivi, residual 0 | 34.30 | 0.625 |
-| int4 kivi, residual 32 | 34.21 | 0.626 |
-| int4 kivi, residual 128 | 34.26 | 0.630 |
-| int2 per-token g32 | 129.3 | 0.375 |
-| int2 kivi, residual 0 | 38.09 | 0.375 |
-| int2 kivi, residual 32 | 37.90 | 0.377 |
-| int2 kivi, residual 128 | 37.49 | 0.381 |
-
-Per-channel keys still win by a lot when done properly in decode, and a small fp16 window helps a
-little more. The window is free at long context (128 fp16 tokens out of 32k barely changes the bytes),
-but at 512 tokens a 128 window is a quarter of the cache, so it matters most for short prompts.
-
-## FP8 instead of integers
-
-`fp8.py` adds an fp8 KV cache: 1 byte per value with no group scales, which Hopper-class chips
-can read natively, so dequant is a single convert.
-
-| KV | bytes/value | step speedup at 32k, batch 16 (Llama-3-8B) | GPT-2 ppl |
-|---|---|---|---|
-| fp16 | 2.0 | 1.00x | 31.17 |
-| fp8 e4m3 | 1.0 | 1.70x | 31.28 |
-| fp8 e4m3, per-token scale | ~1.0 | 1.70x | 31.25 |
-| fp8 e5m2 | 1.0 | 1.70x | 31.71 |
-| int8 g64 | 1.06 | 1.68x | 31.17 |
-| int4 K per-channel | 0.59 | 2.44x | 31.28 |
-
-(The speedup column uses the roofline's int8 g128 and int4 g64 formats; the ppl column uses the
-formats named in the row, so bytes differ slightly.)
-
-Fp8 and int8 move the same bytes, but int8 with group scales is more accurate (3 mantissa bits in
-e4m3 vs 8 bits inside a tight range). e4m3 costs about as much accuracy as int4 with per-channel keys,
-which moves 40% fewer bytes. Fp8's real advantage is hardware support, not accuracy or traffic.
-e5m2 trades mantissa for range the KV cache doesn't need. Tables: `results/fp8_roofline.csv`,
-`results/ppl_gpt2_fp8.csv`.
+Unfused, smaller caches are slower: each block is converted to a new fp32 tensor in memory, so it
+moves more bytes than fp32 does. Fused int8 beats fp32 by ~1.4x (another run gave 2.7x), well short
+of the 3.9x byte saving, because the CPU's arithmetic becomes the limit. Unpacking int4 costs more,
+so it ends up around fp32 speed at long context.
 
 ## Multi-chip
 
-`multichip.py` extends the step model to tensor parallel across N chips with two all-reduces per
-layer, Llama-2-70B on H100s (NVLink 450 GB/s per direction, 2 us per hop).
+`multichip.py` models tensor parallel Llama-2-70B on H100s (NVLink 450 GB/s per direction, two
+all-reduces per layer, 2 us per hop).
 
-```
-python multichip.py
-```
+8 chips, batch 32, 32k context:
 
-**Compressing KV makes the interconnect matter more.** On 8 chips at batch 32, 32k context, int4 KV
-cuts memory time from 17.9 ms to 8.7 ms, but the ring all-reduces stay at 4.8 ms, so their share of
-the step goes from 21% to 35% (`multichip_breakdown.png`, `multichip_link_share.png`).
+| setup | step | all-reduce share |
+|---|---|---|
+| fp16 KV, ring | 22.8 ms | 21% |
+| int4 KV, ring | 13.5 ms | 35% |
+| int4 KV, in-network reduction | 9.6 ms | 9% |
 
-**In-network reduction pulls it back.** If the switch does the sum (NVLink SHARP style) each chip
-sends its partial once and the latency is two hops instead of 2(N-1). All-reduce time drops from
-4.8 ms to 0.8 ms and the step goes from 13.5 ms to 9.6 ms. Decode all-reduces are tiny (32 x 8192 x 2 B),
-so this is mostly a latency win; compressing activations to int8 on top only saves another 0.1 ms.
+INT4 halves memory time but the all-reduces stay at 4.8 ms, so they matter more. Decode all-reduces
+are tiny (32 x 8192 x 2 B), so they're latency bound; letting the switch do the sum cuts 2(N-1) hops
+to 2 and the all-reduce time to 0.8 ms. Compressing activations to int8 on top saves another 0.1 ms.
+The 2 us hop latency is a guess; sweeping 0.25-10 us changes the size of the win (1.1 to 9.7 ms) but
+not the ordering.
 
-The 2 us per hop is a guess, so `multichip_latency_sweep.png` sweeps it from 0.25 to 10 us. At 0.5 us
-in-network saves 1.1 ms per step (10.2 vs 9.1 ms), at 5 us it saves 9.7 ms (20.3 vs 10.5 ms). The
-ordering never flips, only the size of the win.
+Llama-2-70B has 8 KV heads, so past 8 chips heads get copied and per-chip KV traffic stops
+shrinking. 8 to 32 chips only takes the fp16 step from 18.8 to 14.9 ms.
 
-**KV heads run out.** Llama-2-70B has 8 KV heads, so past 8 chips each KV head gets copied and
-per-chip KV traffic stops shrinking. Going from 8 to 32 chips only speeds up a 32k step from
-18.8 to 14.9 ms with fp16 KV (`multichip_scaling.csv`); int4 KV helps more here than adding chips does.
+Moving a 32k-token cache from a prefill chip to a decode chip: 10.7 GB in fp16, 3.0 GB in int4.
+That's 24 vs 6.7 ms over NVLink, 0.86 vs 0.24 s over 100 GbE.
 
-**KV migration** (prefill on one chip, decode on another): a 32k context of Llama-2-70B is 10.7 GB in
-fp16 and 3.0 GB in int4, i.e. 24 ms vs 6.7 ms over NVLink or 0.86 s vs 0.24 s over 100 GbE
-(`kv_migration.csv`). Compression lowers the link traffic just like it lowers HBM traffic.
-
-Context-parallel decode (splitting the cache along the sequence) would need a softmax-aware
-combine (max, then rescaled sum), which plain sum/max in-switch reduction can only do in two passes.
+Splitting the cache across chips by sequence would need a max-then-rescaled-sum combine, which a
+sum/max switch reduction can only do in two passes.
 
 ## Limitations
 
-- The roofline uses peak datasheet numbers and assumes compute, memory and links overlap perfectly.
-  No paged-attention overhead, no kernel launch costs, no prefill.
-- SCALE-Sim models one array with no data types; narrow KV is faked by giving it more words per cycle.
-- Perplexity is on WikiText-2 only, 64k tokens for GPT-2 and 16k for TinyLlama. Long-context
-  quality (where KV quantization matters most) isn't measured, the models here only see 1-2k tokens.
-- CPU timings were taken on battery and move around a lot between runs; the trends held, the exact
-  speedups didn't.
-- The multi-chip model is analytical: the 2 us hop latency is a guess (swept above), there is no
-  congestion, and the in-network reduction is idealized.
+- Roofline uses peak specs and perfect overlap; no paged attention, kernel launch cost or prefill.
+- SCALE-Sim models a single array and fakes narrow KV with extra bandwidth.
+- Perplexity is short-context WikiText-2 only; long-context quality isn't measured.
+- CPU timings are noisy (battery).
+- The multi-chip model is analytical with no congestion and an idealized switch reduction.
 
-## Tests and rerunning
+## Files
 
-```
-python -m pytest
-python run_all.py          # everything fast
-python run_all.py --all    # also the simulator and perplexity runs, a few hours
-```
+| file | |
+|---|---|
+| `roofline.py`, `plots.py` | roofline model and figures |
+| `simulate.py`, `crosscheck.py`, `compare_sim.py`, `dataflow.py` | SCALE-Sim runs |
+| `quant.py` | fake quant, KIVI keys, fp8, int4 packing |
+| `ppl.py`, `plot_ppl.py`, `decode_check.py`, `kivi.py`, `fp8.py` | accuracy |
+| `cpu_bench.py`, `fused_bench.py` | CPU benchmarks |
+| `multichip.py` | multi-chip model |
+| `run_all.py`, `tests/` | rerun everything, `python -m pytest` |
 
-Checks the byte counts against hand math, that the crossover batch really balances compute and
-memory time, the all-reduce byte counts, and that int4 packing round trips.
-
+Results are in `results/` and figures in `results/figures/`.
